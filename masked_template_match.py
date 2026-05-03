@@ -141,7 +141,7 @@ def index_scenarios(payload):
 def print_comparison(orig, new):
     print()
     print("=" * 96)
-    print("Apples-to-apples masked matchTemplate (ms per call)")
+    print("masked matchTemplate (ms per call)")
     print("=" * 96)
     print(f"original cv2: {orig['cv2_file']}  v{orig['cv2_version']}  "
           f"OpenCL={orig['have_opencl']}  CUDA={orig['cuda_devices']}")
