@@ -1,11 +1,9 @@
-# Build cv2 from original_opencv and new_opencv if not already built,
-# then run the masked-matchTemplate benchmark.
+# Build cv2 from original_opencv and new_opencv if missing, then run the
+# masked-matchTemplate benchmark.
 #
-# Any args you pass are forwarded to masked_template_match.py, e.g.:
-#   .\run.ps1 --img-size 4096 --tpl-size 256 --runs 20
-#
-# Pass --fresh to wipe both opencv build dirs and rebuild from scratch.
-# Pass --clean-new to wipe only the new_opencv build and rebuild it.
+#   .\run.ps1              # build if needed, then run
+#   .\run.ps1 --fresh      # wipe and rebuild both opencv trees first
+#   .\run.ps1 --clean-new  # wipe and rebuild only the new tree first
 
 $ErrorActionPreference = 'Stop'
 
@@ -23,12 +21,11 @@ if (-not $env:PYTHON) {
 
 $Fresh = $false
 $CleanNew = $false
-$Passthrough = @()
 foreach ($arg in $args) {
     switch ($arg) {
         '--fresh'     { $Fresh = $true }
         '--clean-new' { $CleanNew = $true }
-        default       { $Passthrough += $arg }
+        default       { throw "unknown arg: $arg" }
     }
 }
 
@@ -91,14 +88,7 @@ Write-Host "==> original cv2: $OrigPath"
 Write-Host "==> new      cv2: $NewPath"
 Write-Host ""
 
-$runsSet = $false
-foreach ($a in $Passthrough) {
-    if ($a -eq '--runs' -or $a -like '--runs=*') { $runsSet = $true; break }
-}
-if (-not $runsSet) { $Passthrough += @('--runs', '20') }
-
 & $Python (Join-Path $Here 'masked_template_match.py') `
     --original-cv2 $OrigPath `
-    --new-cv2      $NewPath `
-    @Passthrough
+    --new-cv2      $NewPath
 exit $LASTEXITCODE
