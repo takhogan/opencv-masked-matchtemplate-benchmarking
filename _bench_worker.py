@@ -19,7 +19,7 @@ import time
 
 METHODS = ["TM_CCORR_NORMED", "TM_SQDIFF_NORMED"]
 WARMUP = 1
-RUNS = 3
+RUNS = 10
 
 
 def log(msg):
