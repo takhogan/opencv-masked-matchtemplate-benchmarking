@@ -1,23 +1,25 @@
 """
 Single-build benchmark worker.
 
-Loads a specific cv2 build (controlled by --cv2-path) and runs masked
-matchTemplate benchmarks on a list of scenarios. Each scenario is either:
-  {"name": "...", "kind": "synthetic", "img_size": N, "tpl_size": M, "seed": K}
-  {"name": "...", "kind": "files", "image": "...", "template": "...",
-                   "mask": "..."|null}
+Imports a specific cv2 (controlled by --cv2-path) and runs masked
+matchTemplate timings for every scenario in --scenarios-file. After
+timing, optionally writes annotated images to --annotate-dir using the
+same cv2 — these are NOT included in the timing measurements.
 
-Scenarios come from --scenarios-file (a JSON list). If absent, a single
-synthetic scenario is built from --img-size / --tpl-size.
-
-Emits a single JSON object on stdout. Human-readable progress goes to stderr.
+Emits a JSON payload describing the run to --out.
 """
 
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
+
+
+METHODS = ["TM_CCORR_NORMED", "TM_SQDIFF_NORMED"]
+WARMUP = 2
+RUNS = 20
 
 
 def log(msg):
@@ -31,12 +33,7 @@ def import_cv2(cv2_path):
     return cv2
 
 
-def maybe_enable_templmatch_trace():
-    if os.environ.get("OCV_BENCH_TEMPLMATCH"):
-        log("[trace] OCV_BENCH_TEMPLMATCH=1 — per-phase timings will follow")
-
-
-def synthetic_inputs(cv2, img_size, tpl_size, seed=0):
+def synthetic_inputs(cv2, img_size=2048, tpl_size=128, seed=0):
     import numpy as np
     rng = np.random.default_rng(seed)
     img = rng.integers(0, 256, (img_size, img_size, 3), dtype=np.uint8)
@@ -69,23 +66,19 @@ def file_inputs(cv2, image_path, template_path, mask_path):
 
 
 def load_scenario(cv2, sc):
-    kind = sc.get("kind", "synthetic")
-    if kind == "synthetic":
+    if sc.get("kind", "synthetic") == "synthetic":
         return synthetic_inputs(cv2,
                                 sc.get("img_size", 2048),
                                 sc.get("tpl_size", 128),
                                 sc.get("seed", 0))
-    if kind == "files":
-        return file_inputs(cv2, sc["image"], sc["template"], sc.get("mask"))
-    raise ValueError(f"unknown scenario kind: {kind}")
+    return file_inputs(cv2, sc["image"], sc["template"], sc.get("mask"))
 
 
-def time_it(fn, warmup, runs):
-    import statistics
-    for _ in range(warmup):
+def time_it(fn):
+    for _ in range(WARMUP):
         fn()
     times = []
-    for _ in range(runs):
+    for _ in range(RUNS):
         t0 = time.perf_counter()
         fn()
         times.append(time.perf_counter() - t0)
@@ -94,7 +87,7 @@ def time_it(fn, warmup, runs):
     return {"mean": mean, "std": std, "runs": list(times)}
 
 
-def bench_cpu(cv2, img, tpl, mask, method, warmup, runs):
+def bench_cpu(cv2, img, tpl, mask, method):
     prev = None
     if cv2.ocl.haveOpenCL():
         prev = cv2.ocl.useOpenCL()
@@ -102,27 +95,24 @@ def bench_cpu(cv2, img, tpl, mask, method, warmup, runs):
     try:
         run = lambda: cv2.matchTemplate(img, tpl, method, mask=mask)
         out = run()
-        return time_it(run, warmup, runs), out
+        return time_it(run), out
     finally:
         if prev is not None:
             cv2.ocl.setUseOpenCL(prev)
 
 
-def bench_umat(cv2, img, tpl, mask, method, warmup, runs):
+def bench_umat(cv2, img, tpl, mask, method):
     cv2.ocl.setUseOpenCL(True)
-    u_img = cv2.UMat(img)
-    u_tpl = cv2.UMat(tpl)
-    u_mask = cv2.UMat(mask)
+    u_img, u_tpl, u_mask = cv2.UMat(img), cv2.UMat(tpl), cv2.UMat(mask)
 
     def run():
-        r = cv2.matchTemplate(u_img, u_tpl, method, mask=u_mask)
-        return r.get()
+        return cv2.matchTemplate(u_img, u_tpl, method, mask=u_mask).get()
 
     out = run()
-    return time_it(run, warmup, runs), out
+    return time_it(run), out
 
 
-def bench_cuda(cv2, img, tpl, mask, method, warmup, runs):
+def bench_cuda(cv2, img, tpl, mask, method):
     g_img = cv2.cuda_GpuMat();  g_img.upload(img)
     g_tpl = cv2.cuda_GpuMat();  g_tpl.upload(tpl)
     g_mask = cv2.cuda_GpuMat(); g_mask.upload(mask)
@@ -136,53 +126,77 @@ def bench_cuda(cv2, img, tpl, mask, method, warmup, runs):
     def run():
         if matcher is not None:
             try:
-                r = matcher.match(g_img, g_tpl, mask=g_mask)
-                return r.download()
+                return matcher.match(g_img, g_tpl, mask=g_mask).download()
             except TypeError:
                 pass
-        r = cv2.cuda.matchTemplate(g_img, g_tpl, method, mask=g_mask)
-        return r.download()
+        return cv2.cuda.matchTemplate(g_img, g_tpl, method, mask=g_mask).download()
 
     out = run()
-    return time_it(run, warmup, runs), out
+    return time_it(run), out
+
+
+BENCHERS = {"cpu": bench_cpu, "umat": bench_umat, "cuda": bench_cuda}
+
+
+def annotate_scenarios(cv2, scenarios, out_dir, count=3):
+    """Draw best-match boxes on a few file scenarios. Not timed."""
+    import numpy as np
+    file_scs = [s for s in scenarios if s.get("kind") == "files"]
+    if not file_scs:
+        return
+    step = max(1, len(file_scs) // count)
+    chosen = file_scs[::step][:count]
+
+    os.makedirs(out_dir, exist_ok=True)
+    method = cv2.TM_CCORR_NORMED
+    for sc in chosen:
+        try:
+            img, tpl, mask = load_scenario(cv2, sc)
+        except Exception as e:
+            log(f"[annotate] skip {sc['name']}: {e}")
+            continue
+        res = cv2.matchTemplate(img, tpl, method, mask=mask)
+        res = np.where(np.isfinite(res), res, -np.inf)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        h, w = tpl.shape[:2]
+        annotated = img.copy()
+        cv2.rectangle(annotated, max_loc,
+                      (max_loc[0] + w, max_loc[1] + h), (0, 255, 0), 3)
+        label = f"{os.path.basename(sc['template'])}  score={max_val:.3f}"
+        cv2.putText(annotated, label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
+        cv2.putText(annotated, label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # template thumbnail in top-right
+        th, tw = tpl.shape[:2]
+        x0 = annotated.shape[1] - tw - 10
+        annotated[10:10 + th, x0:x0 + tw] = tpl
+        cv2.rectangle(annotated, (x0 - 1, 9),
+                      (x0 + tw + 1, 11 + th), (255, 255, 0), 2)
+
+        out = os.path.join(out_dir, f"annotated__{sc['name']}.png")
+        cv2.imwrite(out, annotated)
+        log(f"[annotate] wrote {out}")
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--cv2-path", default=None)
+    p.add_argument("--cv2-path", required=True)
     p.add_argument("--label", required=True)
-    p.add_argument("--backends", nargs="+",
-                   default=["cpu", "umat", "cuda"],
+    p.add_argument("--backends", nargs="+", required=True,
                    choices=["cpu", "umat", "cuda"])
-    p.add_argument("--methods", nargs="+",
-                   default=["TM_CCORR_NORMED", "TM_SQDIFF_NORMED"])
-    p.add_argument("--scenarios-file", default=None,
-                   help="JSON list of scenarios. If absent, a single synthetic "
-                        "scenario is built from --img-size/--tpl-size.")
-    p.add_argument("--img-size", type=int, default=2048)
-    p.add_argument("--tpl-size", type=int, default=128)
-    p.add_argument("--warmup", type=int, default=2)
-    p.add_argument("--runs", type=int, default=10)
-    p.add_argument("--trace-templmatch", action="store_true",
-                   help="Set OCV_BENCH_TEMPLMATCH=1 and run a single warmup+1-run "
-                        "trace per (scenario,method,backend) to find bottlenecks.")
-    p.add_argument("--out", default=None,
-                   help="If set, write JSON results here instead of stdout. "
-                        "Useful when verbose OpenCL logs spam stdout.")
-    p.add_argument("--results-dir", default=None,
-                   help="If set, save raw output arrays as .npy files here for "
-                        "an integrity check by the orchestrator.")
+    p.add_argument("--scenarios-file", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--results-dir", required=True,
+                   help="Directory to dump raw .npy outputs for integrity check.")
+    p.add_argument("--annotate-dir", default=None,
+                   help="If set, draw best-match boxes on a few file scenarios "
+                        "after timing (does not affect benchmark timings).")
     args = p.parse_args()
 
-    if args.trace_templmatch:
-        os.environ["OCV_BENCH_TEMPLMATCH"] = "1"
-        args.warmup = 1
-        args.runs = 1
-
     cv2 = import_cv2(args.cv2_path)
-    maybe_enable_templmatch_trace()
 
-    methods = {
+    method_map = {
         "TM_SQDIFF":        cv2.TM_SQDIFF,
         "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED,
         "TM_CCORR":         cv2.TM_CCORR,
@@ -194,35 +208,25 @@ def main():
     have_opencl = bool(cv2.ocl.haveOpenCL())
     cuda_count = (cv2.cuda.getCudaEnabledDeviceCount()
                   if hasattr(cv2, "cuda") else 0)
-    have_cuda = cuda_count > 0
 
     log(f"[{args.label}] cv2 from {cv2.__file__}")
     log(f"[{args.label}] version={cv2.__version__} OpenCL={have_opencl} "
         f"CUDA devices={cuda_count}")
 
-    if args.scenarios_file:
-        with open(args.scenarios_file) as fh:
-            scenarios = json.load(fh)
-    else:
-        scenarios = [{
-            "name": f"synthetic_{args.img_size}x{args.tpl_size}",
-            "kind": "synthetic",
-            "img_size": args.img_size,
-            "tpl_size": args.tpl_size,
-        }]
+    with open(args.scenarios_file) as fh:
+        scenarios = json.load(fh)
 
     backends = []
     for b in args.backends:
         if b == "umat" and not have_opencl:
             log(f"[{args.label}] skipping UMat (no OpenCL)")
             continue
-        if b == "cuda" and not have_cuda:
+        if b == "cuda" and cuda_count == 0:
             log(f"[{args.label}] skipping CUDA (no device)")
             continue
         backends.append(b)
 
-    benchers = {"cpu": bench_cpu, "umat": bench_umat, "cuda": bench_cuda}
-
+    import numpy as np
     scenarios_out = []
     for sc in scenarios:
         sc_name = sc["name"]
@@ -230,41 +234,37 @@ def main():
             img, tpl, mask = load_scenario(cv2, sc)
         except Exception as e:
             log(f"[{args.label}] scenario {sc_name} load FAILED: {e}")
-            scenarios_out.append({
-                "name": sc_name, "spec": sc, "error": str(e), "results": {},
-            })
+            scenarios_out.append({"name": sc_name, "spec": sc,
+                                  "error": str(e), "results": {}})
             continue
         log(f"[{args.label}] scenario {sc_name}: img={img.shape} tpl={tpl.shape}")
 
         results = {}
-        for name in args.methods:
-            if name not in methods:
-                log(f"[{args.label}] unknown method {name}, skipping")
-                continue
-            method = methods[name]
+        for name in METHODS:
+            method = method_map[name]
             results[name] = {}
             for b in backends:
                 try:
-                    t, out = benchers[b](cv2, img, tpl, mask, method,
-                                         args.warmup, args.runs)
+                    t, out = BENCHERS[b](cv2, img, tpl, mask, method)
                     results[name][b] = t
-                    if args.results_dir is not None and out is not None:
-                        import numpy as np
-                        fname = f"{args.label}__{sc_name}__{name}__{b}.npy"
-                        np.save(os.path.join(args.results_dir, fname),
-                                np.asarray(out))
+                    fname = f"{args.label}__{sc_name}__{name}__{b}.npy"
+                    np.save(os.path.join(args.results_dir, fname),
+                            np.asarray(out))
                     log(f"[{args.label}] {sc_name:<28} {name:<18} {b:<5} "
                         f"{t['mean'] * 1e3:8.2f} ± {t['std'] * 1e3:6.2f} ms")
                 except Exception as e:
                     results[name][b] = None
                     log(f"[{args.label}] {sc_name} {name} {b} ERROR: {e}")
         scenarios_out.append({
-            "name": sc_name,
-            "spec": sc,
+            "name": sc_name, "spec": sc,
             "img_shape": list(img.shape),
             "tpl_shape": list(tpl.shape),
             "results": results,
         })
+
+    if args.annotate_dir:
+        log(f"[{args.label}] annotating scenarios -> {args.annotate_dir}")
+        annotate_scenarios(cv2, scenarios, args.annotate_dir)
 
     payload = {
         "label": args.label,
@@ -272,17 +272,14 @@ def main():
         "cv2_version": cv2.__version__,
         "have_opencl": have_opencl,
         "cuda_devices": cuda_count,
-        "warmup": args.warmup,
-        "runs": args.runs,
+        "warmup": WARMUP,
+        "runs": RUNS,
         "backends": backends,
+        "methods": METHODS,
         "scenarios": scenarios_out,
     }
-    if args.out:
-        with open(args.out, "w") as fh:
-            json.dump(payload, fh)
-    else:
-        json.dump(payload, sys.stdout)
-        sys.stdout.write("\n")
+    with open(args.out, "w") as fh:
+        json.dump(payload, fh)
 
 
 if __name__ == "__main__":

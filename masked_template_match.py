@@ -1,27 +1,20 @@
 """
-masked matchTemplate benchmark.
+Masked matchTemplate benchmark — orchestrator.
 
-Spawns the worker (_bench_worker.py) once per cv2 build:
-  * --original-cv2   path to the cv2 module built from original_opencv
-  * --new-cv2        path to the cv2 module built from new_opencv
-
-Each child process imports its own cv2, runs CPU / UMat / CUDA timings on
-every scenario, and emits JSON. The orchestrator aggregates and prints a
-side-by-side comparison per scenario:
-
-    UMat  : original_opencv   vs   new_opencv
-    CUDA  : new_opencv only
+Spawns _bench_worker.py once per cv2 build (original / new), aggregates
+results, prints a side-by-side comparison, runs an integrity check, and
+writes:
+  - bench_results.json  (mean/std per scenario/method/backend)
+  - bench_plots/annotated/*.png  (best-match boxes drawn on a few images
+    by the new cv2; produced AFTER timing so it doesn't affect numbers)
 
 Scenarios:
-  * always: one synthetic scenario (--img-size / --tpl-size)
-  * if data/images/ and data/templates/ exist and contain images,
-    one scenario for every (image, template) combination. Templates
-    are paired with `<base>-mask.<ext>` siblings in data/templates/;
-    `*-mask.*` files are themselves excluded from the template list.
-    If a mask is missing a warning is printed and a full-on mask is
-    used instead.
+  - one synthetic scenario (2048x128 random image with circular mask)
+  - one scenario per (image, template) under data/images/ x data/templates/
+    Each template is paired with its sibling <base>-mask.<ext>.
 
-Disable real-image scenarios with --no-pairs.
+Usage:
+    python masked_template_match.py --original-cv2 PATH --new-cv2 PATH
 """
 
 import argparse
@@ -41,8 +34,13 @@ DATA_DIR = os.path.join(HERE, "data")
 IMG_DIR = os.path.join(DATA_DIR, "images")
 TPL_DIR = os.path.join(DATA_DIR, "templates")
 
+DATA_FILE = os.path.join(HERE, "bench_results.json")
+PLOTS_DIR = os.path.join(HERE, "bench_plots")
+ANNOTATE_DIR = os.path.join(PLOTS_DIR, "annotated")
+
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 MASK_SUFFIX = "-mask"
+METHODS = ["TM_CCORR_NORMED", "TM_SQDIFF_NORMED"]
 
 
 def list_images(d, exclude_masks=False):
@@ -52,49 +50,37 @@ def list_images(d, exclude_masks=False):
     for f in sorted(os.listdir(d)):
         if f.startswith(".") or not f.lower().endswith(IMAGE_EXTS):
             continue
-        base = os.path.splitext(f)[0]
-        if exclude_masks and base.endswith(MASK_SUFFIX):
+        if exclude_masks and os.path.splitext(f)[0].endswith(MASK_SUFFIX):
             continue
         out.append(os.path.join(d, f))
     return out
 
 
 def find_mask_for(template_path):
-    """Mask lives next to the template as `<base>-mask.<ext>`."""
     d = os.path.dirname(template_path)
     base, ext = os.path.splitext(os.path.basename(template_path))
-    cand = os.path.join(d, f"{base}{MASK_SUFFIX}{ext}")
-    if os.path.exists(cand):
-        return cand
-    for e in IMAGE_EXTS:
+    for e in (ext, *IMAGE_EXTS):
         cand = os.path.join(d, f"{base}{MASK_SUFFIX}{e}")
         if os.path.exists(cand):
             return cand
     return None
 
 
-def build_scenarios(img_size, tpl_size, include_pairs):
+def build_scenarios():
     scenarios = [{
-        "name": f"synthetic_{img_size}x{tpl_size}",
+        "name": "synthetic_2048x128",
         "kind": "synthetic",
-        "img_size": img_size,
-        "tpl_size": tpl_size,
+        "img_size": 2048,
+        "tpl_size": 128,
     }]
-    if not include_pairs:
-        return scenarios
-
     imgs = list_images(IMG_DIR)
     tpls = list_images(TPL_DIR, exclude_masks=True)
-    if not imgs or not tpls:
-        return scenarios
-
     for img_path, tpl_path in itertools.product(imgs, tpls):
         ib = os.path.splitext(os.path.basename(img_path))[0]
         tb = os.path.splitext(os.path.basename(tpl_path))[0]
         mask_path = find_mask_for(tpl_path)
         if mask_path is None:
-            print(f"WARN: no mask found for template {tpl_path}; "
-                  "scenario will use full-on mask",
+            print(f"WARN: no mask for {tpl_path}; using full-on mask",
                   file=sys.stderr)
         scenarios.append({
             "name": f"{ib}__x__{tb}",
@@ -106,25 +92,22 @@ def build_scenarios(img_size, tpl_size, include_pairs):
     return scenarios
 
 
-def run_worker(python_exe, cv2_path, label, backends, methods,
-               scenarios_file, warmup, runs, results_dir=None):
+def run_worker(cv2_path, label, backends, scenarios_file,
+               results_dir, annotate_dir=None):
     out_fd, out_path = tempfile.mkstemp(prefix=f"bench_{label}_", suffix=".json")
     os.close(out_fd)
 
-    cmd = [python_exe, WORKER,
+    cmd = [sys.executable, WORKER,
+           "--cv2-path", cv2_path,
            "--label", label,
            "--backends", *backends,
-           "--methods", *methods,
            "--scenarios-file", scenarios_file,
-           "--warmup", str(warmup),
-           "--runs", str(runs),
+           "--results-dir", results_dir,
            "--out", out_path]
-    if results_dir:
-        cmd += ["--results-dir", results_dir]
+    if annotate_dir:
+        cmd += ["--annotate-dir", annotate_dir]
     env = os.environ.copy()
-    if cv2_path:
-        cmd += ["--cv2-path", cv2_path]
-        env["PYTHONPATH"] = cv2_path + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = cv2_path + os.pathsep + env.get("PYTHONPATH", "")
 
     print(f"\n>>> {label}: {' '.join(shlex.quote(c) for c in cmd)}",
           file=sys.stderr)
@@ -145,27 +128,17 @@ def _mean(s):
     return s["mean"] if s else None
 
 
-def _std(s):
-    return s["std"] if s else None
-
-
 def fmt_ms(s):
     if s is None:
         return f"{'-':>15}"
     return f"{s['mean'] * 1e3:7.2f}±{s['std'] * 1e3:5.2f}"
 
 
-def fmt_speedup(base, t):
-    if base is None or t is None or t == 0:
-        return f"{'-':>7}"
-    return f"{base / t:6.2f}x"
-
-
 def index_scenarios(payload):
     return {sc["name"]: sc for sc in payload["scenarios"]}
 
 
-def print_comparison(orig, new, methods):
+def print_comparison(orig, new):
     print()
     print("=" * 96)
     print("Apples-to-apples masked matchTemplate (ms per call)")
@@ -178,10 +151,7 @@ def print_comparison(orig, new, methods):
 
     o_idx = index_scenarios(orig)
     n_idx = index_scenarios(new)
-    names = list(o_idx.keys())
-    for n in n_idx:
-        if n not in o_idx:
-            names.append(n)
+    names = list(o_idx) + [n for n in n_idx if n not in o_idx]
 
     header = (f"{'method':<20}"
               f"{'orig CPU':>16}{'new CPU':>16}"
@@ -191,43 +161,35 @@ def print_comparison(orig, new, methods):
     for sc_name in names:
         o_sc = o_idx.get(sc_name, {})
         n_sc = n_idx.get(sc_name, {})
-        o_shape = o_sc.get("img_shape") or n_sc.get("img_shape")
-        t_shape = o_sc.get("tpl_shape") or n_sc.get("tpl_shape")
         print()
-        print(f"--- scenario: {sc_name}  img={o_shape}  tpl={t_shape}")
-        if o_sc.get("error"):
-            print(f"    original load error: {o_sc['error']}")
-        if n_sc.get("error"):
-            print(f"    new load error: {n_sc['error']}")
+        print(f"--- scenario: {sc_name}  "
+              f"img={o_sc.get('img_shape') or n_sc.get('img_shape')}  "
+              f"tpl={o_sc.get('tpl_shape') or n_sc.get('tpl_shape')}")
+        for sc, tag in ((o_sc, "original"), (n_sc, "new")):
+            if sc.get("error"):
+                print(f"    {tag} load error: {sc['error']}")
         print(header)
         print("-" * len(header))
 
         o_res = o_sc.get("results", {})
         n_res = n_sc.get("results", {})
-        for m in methods:
-            o = o_res.get(m, {})
-            n = n_res.get(m, {})
-            o_cpu, n_cpu = o.get("cpu"), n.get("cpu")
-            o_umat, n_umat = o.get("umat"), n.get("umat")
-            n_cuda = n.get("cuda")
-            o_umat_m, n_umat_m, n_cuda_m = _mean(o_umat), _mean(n_umat), _mean(n_cuda)
+        for m in METHODS:
+            o, n = o_res.get(m, {}), n_res.get(m, {})
+            o_umat_m, n_umat_m = _mean(o.get("umat")), _mean(n.get("umat"))
+            n_cuda_m = _mean(n.get("cuda"))
             umat_ratio = (f"{o_umat_m / n_umat_m:6.2f}x"
                           if (o_umat_m and n_umat_m) else "-")
             cuda_ratio = (f"{n_umat_m / n_cuda_m:6.2f}x"
                           if (n_umat_m and n_cuda_m) else "-")
             print(f"{m:<20}"
-                  f"{fmt_ms(o_cpu):>16}{fmt_ms(n_cpu):>16}"
-                  f"{fmt_ms(o_umat):>16}{fmt_ms(n_umat):>16}{umat_ratio:>15}"
-                  f"{fmt_ms(n_cuda):>16}{cuda_ratio:>14}")
+                  f"{fmt_ms(o.get('cpu')):>16}{fmt_ms(n.get('cpu')):>16}"
+                  f"{fmt_ms(o.get('umat')):>16}{fmt_ms(n.get('umat')):>16}"
+                  f"{umat_ratio:>15}"
+                  f"{fmt_ms(n.get('cuda')):>16}{cuda_ratio:>14}")
 
 
-def integrity_check(orig, new, methods, results_dir,
-                    rtol=1e-4, atol=1e-5):
-    """Compare new vs original output arrays for each scenario/method/backend.
-
-    Runs after timing so it doesn't affect runtime measurements. Compares
-    every (scenario, method, backend) where both workers produced an output.
-    """
+def integrity_check(orig, new, results_dir, rtol=1e-4, atol=1e-5):
+    """Compare new vs original output arrays for each scenario/method/backend."""
     import numpy as np
 
     print()
@@ -237,35 +199,29 @@ def integrity_check(orig, new, methods, results_dir,
 
     o_idx = index_scenarios(orig)
     n_idx = index_scenarios(new)
-    common = [s for s in o_idx if s in n_idx]
 
     total = passed = failed = missing = 0
-    for sc_name in common:
+    for sc_name in (s for s in o_idx if s in n_idx):
         o_res = o_idx[sc_name].get("results", {})
         n_res = n_idx[sc_name].get("results", {})
-        for m in methods:
+        for m in METHODS:
             o_b = o_res.get(m, {})
             n_b = n_res.get(m, {})
-            backends = set(o_b) & set(n_b)
-            for b in sorted(backends):
+            for b in sorted(set(o_b) & set(n_b)):
                 if _mean(o_b.get(b)) is None or _mean(n_b.get(b)) is None:
                     continue
-                o_path = os.path.join(
-                    results_dir, f"original__{sc_name}__{m}__{b}.npy")
-                n_path = os.path.join(
-                    results_dir, f"new__{sc_name}__{m}__{b}.npy")
+                o_path = os.path.join(results_dir, f"original__{sc_name}__{m}__{b}.npy")
+                n_path = os.path.join(results_dir, f"new__{sc_name}__{m}__{b}.npy")
                 if not (os.path.exists(o_path) and os.path.exists(n_path)):
                     missing += 1
-                    print(f"  MISS  {sc_name} {m} {b}: array file not found")
+                    print(f"  MISS  {sc_name} {m} {b}")
                     continue
                 total += 1
-                a = np.load(o_path)
-                c = np.load(n_path)
+                a, c = np.load(o_path), np.load(n_path)
                 if a.shape != c.shape:
                     failed += 1
                     print(f"  FAIL  {sc_name} {m} {b}: shape {a.shape} vs {c.shape}")
-                    continue
-                if np.allclose(a, c, rtol=rtol, atol=atol, equal_nan=True):
+                elif np.allclose(a, c, rtol=rtol, atol=atol, equal_nan=True):
                     passed += 1
                     print(f"  OK    {sc_name} {m} {b}")
                 else:
@@ -282,67 +238,45 @@ def integrity_check(orig, new, methods, results_dir,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--original-cv2", default=None)
-    p.add_argument("--new-cv2", default=None)
-    p.add_argument("--original-python", default=sys.executable)
-    p.add_argument("--new-python", default=sys.executable)
-    p.add_argument("--methods", nargs="+",
-                   default=["TM_CCORR_NORMED", "TM_SQDIFF_NORMED"])
-    p.add_argument("--img-size", type=int, default=2048,
-                   help="Synthetic scenario image side length.")
-    p.add_argument("--tpl-size", type=int, default=128,
-                   help="Synthetic scenario template side length.")
-    p.add_argument("--no-pairs", action="store_true",
-                   help="Skip the data/imgs x data/templates pairs.")
-    p.add_argument("--warmup", type=int, default=2)
-    p.add_argument("--runs", type=int, default=10)
-    p.add_argument("--save-data", default=os.path.join(HERE, "bench_results.json"),
-                   help="Path to write aggregated benchmark data (mean/std per "
-                        "scenario/method/backend) for plot_results.py.")
+    p.add_argument("--original-cv2", required=True)
+    p.add_argument("--new-cv2", required=True)
     args = p.parse_args()
 
-    scenarios = build_scenarios(args.img_size, args.tpl_size,
-                                include_pairs=not args.no_pairs)
-    pair_count = len(scenarios) - 1
-    print(f"==> scenarios: 1 synthetic + {pair_count} image/template pair(s)",
+    scenarios = build_scenarios()
+    print(f"==> scenarios: {len(scenarios)} "
+          f"(1 synthetic + {len(scenarios) - 1} image/template pair(s))",
           file=sys.stderr)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(scenarios, fh)
         scen_path = fh.name
-
     results_dir = tempfile.mkdtemp(prefix="bench_results_")
 
     try:
-        orig = run_worker(args.original_python, args.original_cv2,
-                          label="original",
+        orig = run_worker(args.original_cv2, "original",
                           backends=["cpu", "umat"],
-                          methods=args.methods,
                           scenarios_file=scen_path,
-                          warmup=args.warmup, runs=args.runs,
                           results_dir=results_dir)
-        new = run_worker(args.new_python, args.new_cv2,
-                         label="new",
+        new = run_worker(args.new_cv2, "new",
                          backends=["cpu", "umat", "cuda"],
-                         methods=args.methods,
                          scenarios_file=scen_path,
-                         warmup=args.warmup, runs=args.runs,
-                         results_dir=results_dir)
+                         results_dir=results_dir,
+                         annotate_dir=ANNOTATE_DIR)
     finally:
         try:
             os.unlink(scen_path)
         except OSError:
             pass
 
-    print_comparison(orig, new, args.methods)
-    integrity_check(orig, new, args.methods, results_dir)
+    print_comparison(orig, new)
+    integrity_check(orig, new, results_dir)
     shutil.rmtree(results_dir, ignore_errors=True)
 
-    if args.save_data:
-        with open(args.save_data, "w") as fh:
-            json.dump({"original": orig, "new": new,
-                       "methods": args.methods}, fh, indent=2)
-        print(f"\nbenchmark data saved to {args.save_data}", file=sys.stderr)
+    with open(DATA_FILE, "w") as fh:
+        json.dump({"original": orig, "new": new, "methods": METHODS},
+                  fh, indent=2)
+    print(f"\nbenchmark data saved to {DATA_FILE}", file=sys.stderr)
+    print(f"annotated images in   {ANNOTATE_DIR}", file=sys.stderr)
 
 
 if __name__ == "__main__":
