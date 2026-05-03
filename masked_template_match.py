@@ -14,10 +14,12 @@ side-by-side comparison per scenario:
 
 Scenarios:
   * always: one synthetic scenario (--img-size / --tpl-size)
-  * if data/imgs/ and data/templates/ exist and contain images,
-    one scenario for every (image, template) combination. An optional
-    same-named file in data/masks/ is used as the mask; otherwise a
-    full-on mask is generated.
+  * if data/images/ and data/templates/ exist and contain images,
+    one scenario for every (image, template) combination. Templates
+    are paired with `<base>-mask.<ext>` siblings in data/templates/;
+    `*-mask.*` files are themselves excluded from the template list.
+    If a mask is missing a warning is printed and a full-on mask is
+    used instead.
 
 Disable real-image scenarios with --no-pairs.
 """
@@ -36,29 +38,36 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "_bench_worker.py")
 DATA_DIR = os.path.join(HERE, "data")
-IMG_DIR = os.path.join(DATA_DIR, "imgs")
+IMG_DIR = os.path.join(DATA_DIR, "images")
 TPL_DIR = os.path.join(DATA_DIR, "templates")
-MASK_DIR = os.path.join(DATA_DIR, "masks")
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+MASK_SUFFIX = "-mask"
 
 
-def list_images(d):
+def list_images(d, exclude_masks=False):
     if not os.path.isdir(d):
         return []
-    return sorted(
-        os.path.join(d, f)
-        for f in os.listdir(d)
-        if f.lower().endswith(IMAGE_EXTS) and not f.startswith(".")
-    )
+    out = []
+    for f in sorted(os.listdir(d)):
+        if f.startswith(".") or not f.lower().endswith(IMAGE_EXTS):
+            continue
+        base = os.path.splitext(f)[0]
+        if exclude_masks and base.endswith(MASK_SUFFIX):
+            continue
+        out.append(os.path.join(d, f))
+    return out
 
 
 def find_mask_for(template_path):
-    if not os.path.isdir(MASK_DIR):
-        return None
-    base = os.path.splitext(os.path.basename(template_path))[0]
-    for ext in IMAGE_EXTS:
-        cand = os.path.join(MASK_DIR, base + ext)
+    """Mask lives next to the template as `<base>-mask.<ext>`."""
+    d = os.path.dirname(template_path)
+    base, ext = os.path.splitext(os.path.basename(template_path))
+    cand = os.path.join(d, f"{base}{MASK_SUFFIX}{ext}")
+    if os.path.exists(cand):
+        return cand
+    for e in IMAGE_EXTS:
+        cand = os.path.join(d, f"{base}{MASK_SUFFIX}{e}")
         if os.path.exists(cand):
             return cand
     return None
@@ -75,19 +84,24 @@ def build_scenarios(img_size, tpl_size, include_pairs):
         return scenarios
 
     imgs = list_images(IMG_DIR)
-    tpls = list_images(TPL_DIR)
+    tpls = list_images(TPL_DIR, exclude_masks=True)
     if not imgs or not tpls:
         return scenarios
 
     for img_path, tpl_path in itertools.product(imgs, tpls):
         ib = os.path.splitext(os.path.basename(img_path))[0]
         tb = os.path.splitext(os.path.basename(tpl_path))[0]
+        mask_path = find_mask_for(tpl_path)
+        if mask_path is None:
+            print(f"WARN: no mask found for template {tpl_path}; "
+                  "scenario will use full-on mask",
+                  file=sys.stderr)
         scenarios.append({
             "name": f"{ib}__x__{tb}",
             "kind": "files",
             "image": os.path.abspath(img_path),
             "template": os.path.abspath(tpl_path),
-            "mask": find_mask_for(tpl_path),
+            "mask": os.path.abspath(mask_path) if mask_path else None,
         })
     return scenarios
 

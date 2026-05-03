@@ -1,5 +1,14 @@
 .DS_Store
 __pycache__/
 *.pyc
-data/
 images_deduped/
+bench_results.json
+bench_plots/
+
+# Ignore everything in data/ by default, then whitelist the small
+# benchmark fixtures we want to ship.
+data/*
+!data/images/
+!data/templates/
+data/other_images/
+data/input/
