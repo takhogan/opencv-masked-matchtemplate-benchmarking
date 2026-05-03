@@ -83,7 +83,8 @@ done
 # transitive deps automatically.
 BUILD_LIST="core,imgproc,imgcodecs,python3"
 if [[ "$WITH_CUDA" == "ON" ]]; then
-  BUILD_LIST="$BUILD_LIST,cudaimgproc"
+  # cudev is required by core whenever WITH_CUDA=ON (it lives in opencv_contrib).
+  BUILD_LIST="$BUILD_LIST,cudev,cudaimgproc"
 fi
 # --clean-new implies "build new" unless the user explicitly listed targets.
 if [[ "$CLEAN_NEW" -eq 1 && "$TARGETS_EXPLICIT" -eq 0 ]]; then
