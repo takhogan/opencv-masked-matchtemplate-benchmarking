@@ -20,6 +20,46 @@ if [[ -z "${WITH_CUDA:-}" ]]; then
   if command -v nvcc >/dev/null 2>&1; then WITH_CUDA=ON; else WITH_CUDA=OFF; fi
 fi
 
+# Locate the CUDA driver stub (libcuda.so) when building with CUDA. On systems
+# without a real driver (e.g. Colab build hosts) the stub lives under
+# $CUDA_HOME/lib64/stubs and isn't on the default search path, so cudacodec
+# fails to configure with CUDA_CUDA_LIBRARY-NOTFOUND. Pass it explicitly when
+# we find it; otherwise leave CMake to its own defaults.
+CUDA_STUB_FLAG=()
+if [[ "$WITH_CUDA" == "ON" ]]; then
+  # First check a real driver lib (present on hosts with an Nvidia driver),
+  # then fall back to the stub shipped with the CUDA toolkit.
+  cuda_lib=""
+  for cand in \
+      "${CUDA_CUDA_LIBRARY:-}" \
+      /usr/lib/x86_64-linux-gnu/libcuda.so \
+      /usr/lib64/libcuda.so \
+      /usr/lib/libcuda.so \
+      "${CUDA_HOME:-}/lib64/stubs/libcuda.so" \
+      "${CUDA_PATH:-}/lib64/stubs/libcuda.so" \
+      /usr/local/cuda/lib64/stubs/libcuda.so \
+      /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+      /usr/lib/x86_64-linux-gnu/stubs/libcuda.so; do
+    if [[ -n "$cand" && -e "$cand" ]]; then cuda_lib="$cand"; break; fi
+  done
+  # Last resort: scan common CUDA install roots.
+  if [[ -z "$cuda_lib" ]]; then
+    cuda_lib="$(find /usr/local/cuda* /opt/cuda* /usr/lib /usr/lib64 \
+                  -maxdepth 6 -name 'libcuda.so' 2>/dev/null | head -n1)"
+  fi
+  if [[ -n "$cuda_lib" ]]; then
+    CUDA_STUB_FLAG=(-DCUDA_CUDA_LIBRARY="$cuda_lib")
+    echo "==> CUDA driver lib: $cuda_lib"
+  else
+    echo "!! WITH_CUDA=ON but no libcuda.so found; disabling cudacodec" >&2
+    CUDA_STUB_FLAG=(
+      -DBUILD_opencv_cudacodec=OFF
+      -DWITH_NVCUVID=OFF
+      -DWITH_NVCUVENC=OFF
+    )
+  fi
+fi
+
 # What to build.
 TARGETS=()
 FRESH=0
@@ -105,6 +145,7 @@ build_one() {
       -DBUILD_opencv_apps=OFF \
       -DCMAKE_C_FLAGS="-w" \
       -DCMAKE_CXX_FLAGS="-w" \
+      ${CUDA_STUB_FLAG[@]+"${CUDA_STUB_FLAG[@]}"} \
       ${CMAKE_EXTRA:-}
 
     echo "==> [$tag] building (-j$JOBS)"
