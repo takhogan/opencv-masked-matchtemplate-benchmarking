@@ -59,9 +59,9 @@ Write-Host "==> CUDA    : $WithCuda"
 Write-Host "==> targets : $($Targets -join ' ')"
 Write-Host ""
 
-$PyInc   = & $Python -c 'import sysconfig; print(sysconfig.get_path("include"))'
-$PyLib   = & $Python -c 'import sysconfig,os; libdir=sysconfig.get_config_var("LIBDIR") or sysconfig.get_config_var("installed_base"); ldlib=sysconfig.get_config_var("LDLIBRARY") or ""; print(os.path.join(libdir, ldlib) if ldlib else "")'
-$NumpyInc = & $Python -c 'import numpy; print(numpy.get_include())'
+$PyInc    = & $Python -c "import sysconfig; print(sysconfig.get_path('include'))"
+$PyLib    = & $Python -c "import sysconfig,os; libdir=sysconfig.get_config_var('LIBDIR') or sysconfig.get_config_var('installed_base'); ldlib=sysconfig.get_config_var('LDLIBRARY') or ''; print(os.path.join(libdir, ldlib) if ldlib else '')"
+$NumpyInc = & $Python -c "import numpy; print(numpy.get_include())"
 
 function Build-One {
     param([string]$Tag)
