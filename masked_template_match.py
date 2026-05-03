@@ -127,8 +127,18 @@ def run_worker(python_exe, cv2_path, label, backends, methods,
             pass
 
 
-def fmt_ms(t):
-    return f"{t * 1e3:9.2f}" if t is not None else f"{'-':>9}"
+def _mean(s):
+    return s["mean"] if s else None
+
+
+def _std(s):
+    return s["std"] if s else None
+
+
+def fmt_ms(s):
+    if s is None:
+        return f"{'-':>15}"
+    return f"{s['mean'] * 1e3:7.2f}±{s['std'] * 1e3:5.2f}"
 
 
 def fmt_speedup(base, t):
@@ -160,9 +170,9 @@ def print_comparison(orig, new, methods):
             names.append(n)
 
     header = (f"{'method':<20}"
-              f"{'orig CPU':>11}{'new CPU':>11}"
-              f"{'orig UMat':>12}{'new UMat':>12}{'UMat new/orig':>15}"
-              f"{'new CUDA':>12}{'CUDA vs UMat':>14}")
+              f"{'orig CPU':>16}{'new CPU':>16}"
+              f"{'orig UMat':>16}{'new UMat':>16}{'UMat new/orig':>15}"
+              f"{'new CUDA':>16}{'CUDA vs UMat':>14}")
 
     for sc_name in names:
         o_sc = o_idx.get(sc_name, {})
@@ -186,14 +196,15 @@ def print_comparison(orig, new, methods):
             o_cpu, n_cpu = o.get("cpu"), n.get("cpu")
             o_umat, n_umat = o.get("umat"), n.get("umat")
             n_cuda = n.get("cuda")
-            umat_ratio = (f"{o_umat / n_umat:6.2f}x"
-                          if (o_umat and n_umat) else "-")
-            cuda_ratio = (f"{n_umat / n_cuda:6.2f}x"
-                          if (n_umat and n_cuda) else "-")
+            o_umat_m, n_umat_m, n_cuda_m = _mean(o_umat), _mean(n_umat), _mean(n_cuda)
+            umat_ratio = (f"{o_umat_m / n_umat_m:6.2f}x"
+                          if (o_umat_m and n_umat_m) else "-")
+            cuda_ratio = (f"{n_umat_m / n_cuda_m:6.2f}x"
+                          if (n_umat_m and n_cuda_m) else "-")
             print(f"{m:<20}"
-                  f"{fmt_ms(o_cpu):>11}{fmt_ms(n_cpu):>11}"
-                  f"{fmt_ms(o_umat):>12}{fmt_ms(n_umat):>12}{umat_ratio:>15}"
-                  f"{fmt_ms(n_cuda):>12}{cuda_ratio:>14}")
+                  f"{fmt_ms(o_cpu):>16}{fmt_ms(n_cpu):>16}"
+                  f"{fmt_ms(o_umat):>16}{fmt_ms(n_umat):>16}{umat_ratio:>15}"
+                  f"{fmt_ms(n_cuda):>16}{cuda_ratio:>14}")
 
 
 def integrity_check(orig, new, methods, results_dir,
@@ -223,7 +234,7 @@ def integrity_check(orig, new, methods, results_dir,
             n_b = n_res.get(m, {})
             backends = set(o_b) & set(n_b)
             for b in sorted(backends):
-                if o_b.get(b) is None or n_b.get(b) is None:
+                if _mean(o_b.get(b)) is None or _mean(n_b.get(b)) is None:
                     continue
                 o_path = os.path.join(
                     results_dir, f"original__{sc_name}__{m}__{b}.npy")
@@ -271,6 +282,9 @@ def main():
                    help="Skip the data/imgs x data/templates pairs.")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--runs", type=int, default=10)
+    p.add_argument("--save-data", default=os.path.join(HERE, "bench_results.json"),
+                   help="Path to write aggregated benchmark data (mean/std per "
+                        "scenario/method/backend) for plot_results.py.")
     args = p.parse_args()
 
     scenarios = build_scenarios(args.img_size, args.tpl_size,
@@ -309,6 +323,12 @@ def main():
     print_comparison(orig, new, args.methods)
     integrity_check(orig, new, args.methods, results_dir)
     shutil.rmtree(results_dir, ignore_errors=True)
+
+    if args.save_data:
+        with open(args.save_data, "w") as fh:
+            json.dump({"original": orig, "new": new,
+                       "methods": args.methods}, fh, indent=2)
+        print(f"\nbenchmark data saved to {args.save_data}", file=sys.stderr)
 
 
 if __name__ == "__main__":

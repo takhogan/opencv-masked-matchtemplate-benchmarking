@@ -81,12 +81,17 @@ def load_scenario(cv2, sc):
 
 
 def time_it(fn, warmup, runs):
+    import statistics
     for _ in range(warmup):
         fn()
-    t0 = time.perf_counter()
+    times = []
     for _ in range(runs):
+        t0 = time.perf_counter()
         fn()
-    return (time.perf_counter() - t0) / runs
+        times.append(time.perf_counter() - t0)
+    mean = sum(times) / len(times)
+    std = statistics.pstdev(times) if len(times) > 1 else 0.0
+    return {"mean": mean, "std": std, "runs": list(times)}
 
 
 def bench_cpu(cv2, img, tpl, mask, method, warmup, runs):
@@ -249,7 +254,7 @@ def main():
                         np.save(os.path.join(args.results_dir, fname),
                                 np.asarray(out))
                     log(f"[{args.label}] {sc_name:<28} {name:<18} {b:<5} "
-                        f"{t * 1e3:8.2f} ms")
+                        f"{t['mean'] * 1e3:8.2f} ± {t['std'] * 1e3:6.2f} ms")
                 except Exception as e:
                     results[name][b] = None
                     log(f"[{args.label}] {sc_name} {name} {b} ERROR: {e}")
