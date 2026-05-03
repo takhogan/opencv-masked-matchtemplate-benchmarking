@@ -75,6 +75,16 @@ for arg in "$@"; do
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+# Only build the OpenCV modules the benchmark actually uses. The benchmark
+# exercises CPU matchTemplate (imgproc), OpenCL matchTemplate (UMat path,
+# also in imgproc/core), and CUDA matchTemplate (cudaimgproc). imgcodecs is
+# needed for imread/imwrite, python3 for the bindings. BUILD_LIST resolves
+# transitive deps automatically.
+BUILD_LIST="core,imgproc,imgcodecs,python3"
+if [[ "$WITH_CUDA" == "ON" ]]; then
+  BUILD_LIST="$BUILD_LIST,cudaimgproc"
+fi
 # --clean-new implies "build new" unless the user explicitly listed targets.
 if [[ "$CLEAN_NEW" -eq 1 && "$TARGETS_EXPLICIT" -eq 0 ]]; then
   TARGETS=(new)
@@ -85,6 +95,7 @@ echo "==> python  : $PYTHON"
 echo "==> jobs    : $JOBS"
 echo "==> CUDA    : $WITH_CUDA"
 echo "==> targets : ${TARGETS[*]}"
+echo "==> modules : $BUILD_LIST"
 echo
 
 PY_INC="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
@@ -146,6 +157,7 @@ build_one() {
       -DCMAKE_C_FLAGS="-w" \
       -DCMAKE_CXX_FLAGS="-w" \
       ${CUDA_STUB_FLAG[@]+"${CUDA_STUB_FLAG[@]}"} \
+      -DBUILD_LIST="$BUILD_LIST" \
       ${CMAKE_EXTRA:-}
 
     echo "==> [$tag] building (-j$JOBS)"
