@@ -84,7 +84,10 @@ done
 BUILD_LIST="core,imgproc,imgcodecs,python3"
 if [[ "$WITH_CUDA" == "ON" ]]; then
   # cudev is required by core whenever WITH_CUDA=ON (it lives in opencv_contrib).
-  BUILD_LIST="$BUILD_LIST,cudev,cudaimgproc"
+  # cudaarithm is required by cudaimgproc/match_template.cpp — without it the
+  # CUDA matchTemplate path compiles to a throw_no_cuda() stub even though
+  # HAVE_CUDA is defined (see opencv_contrib cudaimgproc match_template.cpp).
+  BUILD_LIST="$BUILD_LIST,cudev,cudaarithm,cudaimgproc"
 fi
 # --clean-new implies "build new" unless the user explicitly listed targets.
 if [[ "$CLEAN_NEW" -eq 1 && "$TARGETS_EXPLICIT" -eq 0 ]]; then
